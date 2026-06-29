@@ -37,12 +37,12 @@ use reth_provider::{
     StaticFileWriter as _,
 };
 use revm::{
-    context::journaled_state::JournalCheckpoint,
+    context::{BlockEnv, journaled_state::JournalCheckpoint},
     state::{AccountInfo, Bytecode},
 };
 use serde::Deserialize;
 use tempo_chainspec::hardfork::TempoHardfork;
-use tempo_commonware_node_config::{SigningKey, SigningKeyPassphrase, SigningShare};
+use tempo_consensus_config::{SigningKey, SigningKeyPassphrase, SigningShare};
 use tempo_contracts::precompiles::VALIDATOR_CONFIG_V2_ADDRESS;
 use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
 use tempo_precompiles::{
@@ -50,7 +50,7 @@ use tempo_precompiles::{
     storage::{PrecompileStorageProvider, StorageCtx},
     validator_config_v2::ValidatorConfigV2,
 };
-use tempo_primitives::TempoPrimitives;
+use tempo_primitives::{TempoBlockEnv, TempoPrimitives};
 
 use crate::shadowfork::{
     SHADOW_CHAINSPEC_FILE, SHADOW_EPOCH, SHADOWFORK_SIGNING_KEY_SECRET,
@@ -341,7 +341,7 @@ type StorageSnapshot = (StorageOverlay, EmittedEvents);
 struct DbStorageOverlay<'tx, TX> {
     tx: &'tx TX,
     chain_id: u64,
-    block_number: u64,
+    block_env: TempoBlockEnv,
     storage_settings: StorageSettings,
     overlay: StorageOverlay,
     events: EmittedEvents,
@@ -361,7 +361,13 @@ where
         Self {
             tx,
             chain_id,
-            block_number,
+            block_env: TempoBlockEnv {
+                inner: BlockEnv {
+                    number: U256::from(block_number),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             storage_settings,
             overlay: HashMap::new(),
             events: Vec::new(),
@@ -480,16 +486,8 @@ where
         self.chain_id
     }
 
-    fn timestamp(&self) -> U256 {
-        U256::ZERO
-    }
-
-    fn beneficiary(&self) -> Address {
-        Address::ZERO
-    }
-
-    fn block_number(&self) -> u64 {
-        self.block_number
+    fn block_env(&self) -> &TempoBlockEnv {
+        &self.block_env
     }
 
     fn set_code(&mut self, _address: Address, _code: Bytecode) -> Result<(), TempoPrecompileError> {
@@ -608,6 +606,10 @@ where
         let (overlay, events) = self.snapshots.remove(checkpoint.journal_i);
         self.overlay = overlay;
         self.events = events;
+    }
+
+    fn set_tip1060_storage_credits(&mut self, _enabled: bool) {
+        // DbStorageOverlay does not run TIP-1060 accounting.
     }
 }
 

@@ -61,7 +61,7 @@ use tempo_precompiles::{
     SIGNATURE_VERIFIER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
     error::TempoPrecompileError,
     nonce::NonceManager,
-    storage::StorageCtx,
+    storage::{StorageActions, StorageCtx},
     tip_fee_manager::TipFeeManager,
     tip20::{ISSUER_ROLE, TIP20Token},
     tip20_factory::TIP20Factory,
@@ -335,6 +335,7 @@ fn bench_env(
                 ..Default::default()
             },
             timestamp_millis_part: 0,
+            ..Default::default()
         },
     }
 }
@@ -362,6 +363,7 @@ fn seed_in_memory_cache_db(
         &ctx.block,
         &ctx.cfg,
         &ctx.tx,
+        StorageActions::disabled(),
         || {
             TIP403Registry::new().initialize()?;
             TIP20Factory::new().initialize()?;

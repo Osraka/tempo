@@ -28,7 +28,8 @@ use std::collections::{HashMap, HashSet};
 use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardforks};
 use tempo_contracts::precompiles::{
     ADDRESS_REGISTRY_ADDRESS, NATIVE_MULTISIG_ADDRESS, RECEIVE_POLICY_GUARD_ADDRESS,
-    SIGNATURE_VERIFIER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
+    SIGNATURE_VERIFIER_ADDRESS, STORAGE_CREDITS_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS,
+    VALIDATOR_CONFIG_V2_ADDRESS,
 };
 use tempo_primitives::{
     SubBlock, SubBlockMetadata, TempoReceipt, TempoTxEnvelope, TempoTxType,
@@ -494,6 +495,9 @@ where
         if self.inner.spec.is_t6_active_at_timestamp(timestamp) {
             self.deploy_precompile_at_boundary(NATIVE_MULTISIG_ADDRESS)?;
             self.deploy_precompile_at_boundary(RECEIVE_POLICY_GUARD_ADDRESS)?;
+        }
+        if self.inner.spec.is_t7_active_at_timestamp(timestamp) {
+            self.deploy_precompile_at_boundary(STORAGE_CREDITS_ADDRESS)?;
         }
 
         Ok(())
@@ -1643,6 +1647,7 @@ mod tests {
             .build(&mut db, &chainspec);
 
         executor.apply_pre_execution_changes().unwrap();
+        drop(executor);
 
         let acc = db.load_cache_account(VALIDATOR_CONFIG_V2_ADDRESS).unwrap();
         let info = acc.account_info().unwrap();
@@ -1659,6 +1664,7 @@ mod tests {
             .build(&mut db, &chainspec);
 
         executor.apply_pre_execution_changes().unwrap();
+        drop(executor);
 
         let acc = db.load_cache_account(SIGNATURE_VERIFIER_ADDRESS).unwrap();
         let info = acc.account_info().unwrap();
@@ -1675,6 +1681,7 @@ mod tests {
             .build(&mut db, &chainspec);
 
         executor.apply_pre_execution_changes().unwrap();
+        drop(executor);
 
         let acc = db.load_cache_account(NATIVE_MULTISIG_ADDRESS).unwrap();
         let info = acc.account_info().unwrap();
@@ -1695,6 +1702,7 @@ mod tests {
             .build(&mut db, &chainspec);
 
         executor.apply_pre_execution_changes().unwrap();
+        drop(executor);
 
         let acc = db.load_cache_account(SIGNATURE_VERIFIER_ADDRESS).unwrap();
         let info = acc.account_info();
@@ -1717,12 +1725,13 @@ mod tests {
         executor
             .evm_mut()
             .db_mut()
-            .set_state_hook(Some(Box::new(move |state: &EvmState| {
-                hook_calls_clone.lock().unwrap().push(state.clone());
+            .set_state_hook(Some(Box::new(move |state: EvmState| {
+                hook_calls_clone.lock().unwrap().push(state);
             })));
 
         let addr = Address::with_last_byte(0xff);
         executor.deploy_precompile_at_boundary(addr).unwrap();
+        drop(executor);
 
         // Verify code was deployed.
         let acc = db.load_cache_account(addr).unwrap();
@@ -1766,8 +1775,8 @@ mod tests {
         executor
             .evm_mut()
             .db_mut()
-            .set_state_hook(Some(Box::new(move |state: &EvmState| {
-                hook_calls_clone.lock().unwrap().push(state.clone());
+            .set_state_hook(Some(Box::new(move |state: EvmState| {
+                hook_calls_clone.lock().unwrap().push(state);
             })));
 
         executor.deploy_precompile_at_boundary(addr).unwrap();

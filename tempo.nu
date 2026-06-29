@@ -318,15 +318,29 @@ def read-bench-marker [datadir: string] {
 # Comparison mode helpers
 # ============================================================================
 
-# Ordered list of all Tempo hardforks (must match TempoHardfork enum in crates/chainspec)
-const TEMPO_HARDFORKS = ["T0" "T1" "T1A" "T1B" "T1C" "T2" "T3" "T4" "T5" "T6" "T7"]
 const TEMPO_DISABLED_HARDFORK_TIME = 9223372036854775807
 
+def tempo-hardforks [] {
+    let forks = (
+        open crates/node/tests/assets/test-genesis.json
+        | get config
+        | columns
+        | where { |key| $key =~ '^t[0-9]+[a-z]?Time$' }
+        | each { |key| $key | str replace "Time" "" | str upcase }
+    )
+    if ($forks | is-empty) {
+        print "Error: failed to read Tempo hardforks from crates/node/tests/assets/test-genesis.json"
+        exit 1
+    }
+    $forks
+}
+
 def normalize-hardfork [fork: string] {
+    let hardforks = (tempo-hardforks)
     let fork_upper = ($fork | str upcase)
-    let idx = ($TEMPO_HARDFORKS | enumerate | where item == $fork_upper)
+    let idx = ($hardforks | enumerate | where item == $fork_upper)
     if ($idx | length) == 0 {
-        print $"Error: unknown hardfork '($fork)'. Valid: ($TEMPO_HARDFORKS | str join ', ')"
+        print $"Error: unknown hardfork '($fork)'. Valid: ($hardforks | str join ', ')"
         exit 1
     }
     $fork_upper
@@ -334,11 +348,11 @@ def normalize-hardfork [fork: string] {
 
 def hardfork-index [fork: string] {
     let fork_upper = (normalize-hardfork $fork)
-    ($TEMPO_HARDFORKS | enumerate | where item == $fork_upper | get 0.index)
+    (tempo-hardforks | enumerate | where item == $fork_upper | get 0.index)
 }
 
 def latest-tempo-hardfork [] {
-    $TEMPO_HARDFORKS | last
+    tempo-hardforks | last
 }
 
 def highest-hardfork [forks: list<string>] {
@@ -357,7 +371,7 @@ def highest-hardfork [forks: list<string>] {
 
 def hardfork-genesis-config-fields [fork: string] {
     let cutoff = (hardfork-index $fork)
-    $TEMPO_HARDFORKS | enumerate | each { |it|
+    tempo-hardforks | enumerate | each { |it|
         {
             fork: $it.item
             name: $"($it.item | str downcase)Time"
@@ -666,10 +680,8 @@ def run-bench-single [
     let args = (dedup-args $base_args $extra_args)
 
     # Tracy environment variables
-    let tracy_env_prefix = if $tracy == "on" {
-        "TRACY_NO_SYS_TRACE=1 "
-    } else if $tracy == "full" {
-        "TRACY_SAMPLING_HZ=1 "
+    let tracy_env_prefix = if $tracy == "tracy" {
+        "TRACY_SAMPLING_HZ=18999 "
     } else { "" }
 
     # OTEL resource attributes for benchmark identification in logs/traces
@@ -728,6 +740,8 @@ def run-bench-single [
             --git-ref $git_ref
             --build-profile $build_profile
             --benchmark-mode $benchmark_mode
+            --bloat-mib $bloat
+            --bloat-token-count ($TIP20_TOKEN_IDS | length)
             --skip-funding=($bloat > 0))
         if not $result.ok {
             print $"  Benchmark run ($run_label) failed with exit code ($result.exit_code)"
@@ -825,7 +839,7 @@ def upload-samply-profile [profile_path: string] {
     $url
 }
 
-# Upload a tracy profile (.tracy) to R2 via mc and return the viewer URL.
+# Upload a tracy profile (.tracy) to R2 via mc and return the viewer and raw profile URLs.
 # Returns null on failure or if mc is not available.
 # Deletes the large .tracy file after successful upload to save disk.
 def upload-tracy-profile [profile_path: string, label: string, commit_sha: string] {
@@ -846,14 +860,16 @@ def upload-tracy-profile [profile_path: string, label: string, commit_sha: strin
     let remote_name = $"($label)-($short_sha)-($timestamp).tracy"
     let mc_alias = "r2"
     let viewer_base = "https://tracy.tempoxyz.dev"
+    let remote_profile_path = $"/profiles/($remote_name)"
 
     try {
         mc cp $profile_path $"($mc_alias)/tracy/profiles/($remote_name)"
-        let viewer_url = $"($viewer_base)?profile_url=/profiles/($remote_name)"
+        let viewer_url = $"($viewer_base)?profile_url=($remote_profile_path)"
+        let profile_url = $"($viewer_base)($remote_profile_path)"
         print $"  ($label): ($viewer_url)"
         # Delete large .tracy file after upload to free disk
         rm $profile_path
-        $viewer_url
+        { viewer_url: $viewer_url, profile_url: $profile_url }
     } catch {
         print "  Warning: failed to upload tracy profile"
         null
@@ -933,6 +949,8 @@ def generate-summary [
     mut feature_builder_pool_fetch_samples = []
     mut baseline_builder_invalid_tx_execution_attempts_samples = []
     mut feature_builder_invalid_tx_execution_attempts_samples = []
+    mut baseline_builder_reverted_txs = []
+    mut feature_builder_reverted_txs = []
     mut baseline_builder_invalid_tx_skips = []
     mut feature_builder_invalid_tx_skips = []
     mut baseline_builder_nonce_too_low_skips = []
@@ -1072,6 +1090,34 @@ def generate-summary [
         }
     }
 
+    let histogram_delta_sum_total = { |samples: list<any>, metric: string|
+        let sum_name = $"($metric)_sum"
+        let sum_samples = ($samples | where name == $sum_name)
+        if ($sum_samples | length) == 0 {
+            0.0
+        } else {
+            let deltas = (
+                $sum_samples
+                    | group-by { |sample| $sample.labels | to json --raw }
+                    | transpose labels samples
+                    | each { |series|
+                        let points = (
+                            $series.samples
+                                | where { |sample| ($sample | get -o value | default null) != null }
+                                | sort-by unix_ms
+                        )
+                        if ($points | length) > 1 {
+                            let first = ($points | first)
+                            let last = ($points | last)
+                            let delta = ($last.value - $first.value)
+                            if $delta >= 0 { $delta } else { $last.value }
+                        } else { 0.0 }
+                    }
+            )
+            if ($deltas | length) > 0 { $deltas | math sum | math round --precision 0 } else { 0.0 }
+        }
+    }
+
     let metric_sample_names = [
         "reth_tempo_payload_builder_payload_finalization_duration_seconds_sum"
         "reth_tempo_payload_builder_payload_finalization_duration_seconds_count"
@@ -1079,6 +1125,8 @@ def generate-summary [
         "reth_tempo_payload_builder_pool_fetch_duration_seconds_count"
         "reth_tempo_payload_builder_invalid_pool_transaction_execution_attempts_sum"
         "reth_tempo_payload_builder_invalid_pool_transaction_execution_attempts_count"
+        "reth_tempo_payload_builder_reverted_transactions_sum"
+        "reth_tempo_payload_builder_reverted_transactions_count"
         "reth_tempo_payload_builder_pool_transactions_skipped_total"
         "reth_tempo_payload_builder_normal_transaction_fill_idle_duration_seconds_sum"
         "reth_tempo_payload_builder_normal_transaction_fill_idle_duration_seconds_count"
@@ -1199,6 +1247,7 @@ def generate-summary [
         let builder_finish_samples = (do $optional_counter_metric_values "reth_tempo_payload_builder_payload_finalization_duration_seconds" 1000.0)
         let builder_pool_fetch_samples = (do $optional_counter_metric_values "reth_tempo_payload_builder_pool_fetch_duration_seconds" 1000.0)
         let builder_invalid_tx_execution_attempts_samples = (do $optional_counter_metric_values "reth_tempo_payload_builder_invalid_pool_transaction_execution_attempts" 1.0)
+        let builder_reverted_txs = do $histogram_delta_sum_total $metric_samples "reth_tempo_payload_builder_reverted_transactions"
         let builder_pool_tx_skip_samples = ($metric_samples | where name == "reth_tempo_payload_builder_pool_transactions_skipped_total")
         let builder_pool_tx_skips_for_reason = { |reason: string|
             let samples = (
@@ -1227,6 +1276,7 @@ def generate-summary [
             $baseline_builder_finish_samples = ($baseline_builder_finish_samples | append $builder_finish_samples)
             $baseline_builder_pool_fetch_samples = ($baseline_builder_pool_fetch_samples | append $builder_pool_fetch_samples)
             $baseline_builder_invalid_tx_execution_attempts_samples = ($baseline_builder_invalid_tx_execution_attempts_samples | append $builder_invalid_tx_execution_attempts_samples)
+            $baseline_builder_reverted_txs = ($baseline_builder_reverted_txs | append $builder_reverted_txs)
             $baseline_builder_invalid_tx_skips = ($baseline_builder_invalid_tx_skips | append $builder_invalid_tx_skips)
             $baseline_builder_nonce_too_low_skips = ($baseline_builder_nonce_too_low_skips | append $builder_nonce_too_low_skips)
             $baseline_builder_fill_idle_samples = ($baseline_builder_fill_idle_samples | append $builder_fill_idle_samples)
@@ -1242,6 +1292,7 @@ def generate-summary [
             $feature_builder_finish_samples = ($feature_builder_finish_samples | append $builder_finish_samples)
             $feature_builder_pool_fetch_samples = ($feature_builder_pool_fetch_samples | append $builder_pool_fetch_samples)
             $feature_builder_invalid_tx_execution_attempts_samples = ($feature_builder_invalid_tx_execution_attempts_samples | append $builder_invalid_tx_execution_attempts_samples)
+            $feature_builder_reverted_txs = ($feature_builder_reverted_txs | append $builder_reverted_txs)
             $feature_builder_invalid_tx_skips = ($feature_builder_invalid_tx_skips | append $builder_invalid_tx_skips)
             $feature_builder_nonce_too_low_skips = ($feature_builder_nonce_too_low_skips | append $builder_nonce_too_low_skips)
             $feature_builder_fill_idle_samples = ($feature_builder_fill_idle_samples | append $builder_fill_idle_samples)
@@ -1294,6 +1345,7 @@ def generate-summary [
             builder_latency_p90: $run_builder.p90
             builder_latency_p99: $run_builder.p99
             builder_gas_s: $run_builder_gas
+            builder_reverted_txs: $builder_reverted_txs
             tps: $actual_tps
             mgas_s: $mgas_per_sec
             block_time_p50: $run_bt.p50
@@ -1341,6 +1393,8 @@ def generate-summary [
     let f_builder_pool_fetch = do $compute_value_stats $feature_builder_pool_fetch_samples
     let b_builder_invalid_tx_execution_attempts = do $compute_value_stats $baseline_builder_invalid_tx_execution_attempts_samples
     let f_builder_invalid_tx_execution_attempts = do $compute_value_stats $feature_builder_invalid_tx_execution_attempts_samples
+    let b_builder_reverted_txs = if ($baseline_builder_reverted_txs | length) > 0 { $baseline_builder_reverted_txs | math sum | math round --precision 0 } else { 0.0 }
+    let f_builder_reverted_txs = if ($feature_builder_reverted_txs | length) > 0 { $feature_builder_reverted_txs | math sum | math round --precision 0 } else { 0.0 }
     let b_builder_invalid_tx_skips = if ($baseline_builder_invalid_tx_skips | length) > 0 { $baseline_builder_invalid_tx_skips | math sum | math round --precision 0 } else { 0.0 }
     let f_builder_invalid_tx_skips = if ($feature_builder_invalid_tx_skips | length) > 0 { $feature_builder_invalid_tx_skips | math sum | math round --precision 0 } else { 0.0 }
     let b_builder_nonce_too_low_skips = if ($baseline_builder_nonce_too_low_skips | length) > 0 { $baseline_builder_nonce_too_low_skips | math sum | math round --precision 0 } else { 0.0 }
@@ -1412,6 +1466,9 @@ def generate-summary [
         if $base > 0.0 or $feature > 0.0 {
             $"| ($label) | ($base) | ($feature) | (do $delta $base $feature)% |"
         } else { null }
+    }
+    let count_row = { |label: string, base: float, feature: float|
+        $"| ($label) | ($base) | ($feature) | (do $delta $base $feature)% |"
     }
     let to_mgas_s = { |value: float| ($value / 1_000_000.0) | math round --precision 1 }
     let b_builder_mgas = do $to_mgas_s $b_builder_gas
@@ -1509,6 +1566,7 @@ def generate-summary [
         $"| Pool Fetch P99 [ms] | (do $fmt_stat $b_builder_pool_fetch p99) | (do $fmt_stat $f_builder_pool_fetch p99) | (do $fmt_stat_delta $b_builder_pool_fetch $f_builder_pool_fetch p99) |"
         (do $nonzero_stat_row "Invalid Tx Attempts P50" $b_builder_invalid_tx_execution_attempts $f_builder_invalid_tx_execution_attempts p50)
         (do $nonzero_stat_row "Invalid Tx Attempts P99" $b_builder_invalid_tx_execution_attempts $f_builder_invalid_tx_execution_attempts p99)
+        (do $count_row "Reverted Txs" $b_builder_reverted_txs $f_builder_reverted_txs)
         (do $nonzero_count_row "Invalid Tx Skips" $b_builder_invalid_tx_skips $f_builder_invalid_tx_skips)
         (do $nonzero_count_row "Nonce Too Low Skips" $b_builder_nonce_too_low_skips $f_builder_nonce_too_low_skips)
         (do $nonzero_stat_row "Fill Idle P50 [ms]" $b_builder_fill_idle $f_builder_fill_idle p50)
@@ -1576,6 +1634,7 @@ def generate-summary [
                 builder_invalid_tx_execution_attempts_p50: $b_builder_invalid_tx_execution_attempts.p50
                 builder_invalid_tx_execution_attempts_p90: $b_builder_invalid_tx_execution_attempts.p90
                 builder_invalid_tx_execution_attempts_p99: $b_builder_invalid_tx_execution_attempts.p99
+                builder_reverted_txs: $b_builder_reverted_txs
                 builder_invalid_tx_skips: $b_builder_invalid_tx_skips
                 builder_nonce_too_low_skips: $b_builder_nonce_too_low_skips
                 builder_fill_idle_p50: $b_builder_fill_idle.p50
@@ -1613,6 +1672,7 @@ def generate-summary [
                 builder_invalid_tx_execution_attempts_p50: $f_builder_invalid_tx_execution_attempts.p50
                 builder_invalid_tx_execution_attempts_p90: $f_builder_invalid_tx_execution_attempts.p90
                 builder_invalid_tx_execution_attempts_p99: $f_builder_invalid_tx_execution_attempts.p99
+                builder_reverted_txs: $f_builder_reverted_txs
                 builder_invalid_tx_skips: $f_builder_invalid_tx_skips
                 builder_nonce_too_low_skips: $f_builder_nonce_too_low_skips
                 builder_fill_idle_p50: $f_builder_fill_idle.p50
@@ -1650,6 +1710,7 @@ def generate-summary [
                 builder_invalid_tx_execution_attempts_p50: (do $delta $b_builder_invalid_tx_execution_attempts.p50 $f_builder_invalid_tx_execution_attempts.p50)
                 builder_invalid_tx_execution_attempts_p90: (do $delta $b_builder_invalid_tx_execution_attempts.p90 $f_builder_invalid_tx_execution_attempts.p90)
                 builder_invalid_tx_execution_attempts_p99: (do $delta $b_builder_invalid_tx_execution_attempts.p99 $f_builder_invalid_tx_execution_attempts.p99)
+                builder_reverted_txs: (do $delta $b_builder_reverted_txs $f_builder_reverted_txs)
                 builder_invalid_tx_skips: (do $delta $b_builder_invalid_tx_skips $f_builder_invalid_tx_skips)
                 builder_nonce_too_low_skips: (do $delta $b_builder_nonce_too_low_skips $f_builder_nonce_too_low_skips)
                 builder_fill_idle_p50: (do $delta $b_builder_fill_idle.p50 $f_builder_fill_idle.p50)
@@ -1757,6 +1818,8 @@ def "main localnet" [
     --skip-build                           # Skip building tempo and tempo-xtask (assumes binaries are already built)
     --force                                # Kill dangling processes without prompting
     --bloat: int = 0                       # Generate state bloat (size in MiB) for TIP20 tokens
+    --gas-limit: string = ""               # Block gas limit for generated genesis
+    --general-gas-limit: string = ""       # General (non-payment) gas limit for generated genesis
 ] {
     validate-mode $mode
     if $epoch_length <= 0 {
@@ -1773,6 +1836,8 @@ def "main localnet" [
     # Parse custom args
     let extra_args = (parse-cli-args $node_args)
     let samply_args_list = if $samply_args == "" { [] } else { $samply_args | split row " " }
+    let gas_limit_args = if $gas_limit != "" { ["--gas-limit" $gas_limit] } else { [] }
+    let general_gas_limit_args = if $general_gas_limit != "" { ["--general-gas-limit" $general_gas_limit] } else { [] }
 
     # Build first (unless skipped)
     if not $skip_build {
@@ -1784,9 +1849,9 @@ def "main localnet" [
             print "Error: --nodes is only valid with --mode consensus"
             exit 1
         }
-        run-dev-node $accounts $epoch_length $genesis $samply $samply_args_list $reset $profile $skip_build $loud $extra_args $bloat
+        run-dev-node $accounts $epoch_length $genesis $samply $samply_args_list $reset $profile $skip_build $loud $extra_args $bloat $gas_limit_args $general_gas_limit_args
     } else {
-        run-consensus-nodes $nodes $accounts $epoch_length $genesis $samply $samply_args_list $reset $profile $skip_build $loud $extra_args $bloat
+        run-consensus-nodes $nodes $accounts $epoch_length $genesis $samply $samply_args_list $reset $profile $skip_build $loud $extra_args $bloat $gas_limit_args $general_gas_limit_args
     }
 }
 
@@ -1794,7 +1859,7 @@ def "main localnet" [
 # Dev mode
 # ============================================================================
 
-def run-dev-node [accounts: int, epoch_length: int, genesis: string, samply: bool, samply_args: list<string>, reset: bool, profile: string, skip_build: bool, loud: bool, extra_args: list<string>, bloat: int] {
+def run-dev-node [accounts: int, epoch_length: int, genesis: string, samply: bool, samply_args: list<string>, reset: bool, profile: string, skip_build: bool, loud: bool, extra_args: list<string>, bloat: int, gas_limit_args: list<string>, general_gas_limit_args: list<string>] {
     let tempo_bin = if $profile == "dev" {
         "./target/debug/tempo"
     } else {
@@ -1823,7 +1888,7 @@ def run-dev-node [accounts: int, epoch_length: int, genesis: string, samply: boo
             rm -rf $LOCALNET_DIR
             mkdir $LOCALNET_DIR
             print $"Generating genesis with ($accounts) accounts..."
-            run-tempo-xtask $profile $skip_build ["generate-genesis" "--output" $LOCALNET_DIR "-a" $"($accounts)" "--epoch-length" $"($epoch_length)" "--no-dkg-in-genesis"]
+            run-tempo-xtask $profile $skip_build ["generate-genesis" "--output" $LOCALNET_DIR "-a" $"($accounts)" "--epoch-length" $"($epoch_length)" "--no-dkg-in-genesis" ...$gas_limit_args ...$general_gas_limit_args]
         }
 
         # Apply state bloat if requested (requires fresh init)
@@ -1848,6 +1913,7 @@ def run-dev-node [accounts: int, epoch_length: int, genesis: string, samply: boo
 # Build base node arguments shared between dev and consensus modes
 def build-base-args [genesis_path: string, datadir: string, log_dir: string, bind_ip: string, http_port: int, reth_metrics_port: int] {
     let ipc_path = $"($datadir)/reth.ipc"
+    let faucet_token_args = ($TIP20_TOKEN_IDS | each { |id| ["--faucet.address" (txgen-tip20-token-address $id)] } | flatten)
 
     [
         "node"
@@ -1867,8 +1933,7 @@ def build-base-args [genesis_path: string, datadir: string, log_dir: string, bin
         "--faucet.enabled"
         "--faucet.private-key" "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
         "--faucet.amount" "1000000000000"
-        "--faucet.address" "0x20c0000000000000000000000000000000000000"
-        "--faucet.address" "0x20c0000000000000000000000000000000000001"
+        ...$faucet_token_args
     ]
 }
 
@@ -1886,7 +1951,7 @@ def build-dev-args [] {
 # Consensus mode
 # ============================================================================
 
-def run-consensus-nodes [nodes: int, accounts: int, epoch_length: int, genesis: string, samply: bool, samply_args: list<string>, reset: bool, profile: string, skip_build: bool, loud: bool, extra_args: list<string>, bloat: int] {
+def run-consensus-nodes [nodes: int, accounts: int, epoch_length: int, genesis: string, samply: bool, samply_args: list<string>, reset: bool, profile: string, skip_build: bool, loud: bool, extra_args: list<string>, bloat: int, gas_limit_args: list<string>, general_gas_limit_args: list<string>] {
     # Check if we need to generate localnet (only if no custom genesis provided)
     if $genesis == "" {
         let needs_generation = $reset or (not ($LOCALNET_DIR | path exists)) or (
@@ -1906,7 +1971,7 @@ def run-consensus-nodes [nodes: int, accounts: int, epoch_length: int, genesis: 
             let validators = (0..<$nodes | each { |i| $"127.0.0.($i + 1):($i * 100 + 8000)" } | str join ",")
 
             print $"Generating localnet with ($accounts) accounts and ($nodes) validators..."
-            run-tempo-xtask $profile $skip_build ["generate-localnet" "-o" $LOCALNET_DIR "--accounts" $"($accounts)" "--epoch-length" $"($epoch_length)" "--validators" $validators "--force"] | ignore
+            run-tempo-xtask $profile $skip_build ["generate-localnet" "-o" $LOCALNET_DIR "--accounts" $"($accounts)" "--epoch-length" $"($epoch_length)" "--validators" $validators "--force" ...$gas_limit_args ...$general_gas_limit_args] | ignore
         }
     }
 
@@ -2064,7 +2129,6 @@ def "main follower" [
     --node-args: string = ""    # Additional node arguments (space-separated)
     --skip-build                # Skip building (assumes binary is already built)
     --reset                     # Wipe follower data before starting
-    --certify                   # Enable experimental consensus certification in follow mode
 ] {
     # Validate localnet exists
     if not ($LOCALNET_DIR | path exists) {
@@ -2143,7 +2207,6 @@ def "main follower" [
             "--consensus.use-local-defaults"
             "--consensus.bypass-ip-check"
         ]
-        | append (if $certify { ["--follow.experimental.certify"] } else { [] })
         | append (log-filter-args $loud)
         | append $extra_args
 
@@ -2341,7 +2404,7 @@ def "main bench" [
     --bench-datadir: string = ""                    # Node database directory (default: LOCALNET_DIR/reth, /reth-bench for schelk)
     --tune                                          # Apply system tuning for dedicated benchmark runners (Linux only)
     --no-cache                                      # Skip binary cache (force build from source)
-    --tracy: string = "off"                         # Tracy profiling: off, on, full
+    --tracy: string = "off"                         # Tracy profiling: off, tracy
     --tracy-filter: string = "debug"                # Tracy tracing filter level
     --tracy-seconds: int = 30                       # Tracy capture duration limit in seconds (0 = unlimited)
     --tracy-offset: int = 120                       # Seconds to wait before starting tracy capture (default: 120)
@@ -2349,6 +2412,7 @@ def "main bench" [
     --baseline-hardfork: string = ""                # Latest active hardfork for baseline (e.g. T1, T1C, T2)
     --feature-hardfork: string = ""                 # Latest active hardfork for feature (e.g. T1, T1C, T2)
     --gas-limit: string = ""                        # Block gas limit for genesis (raw number, e.g. 1000000000)
+    --general-gas-limit: string = ""                # General (non-payment) gas limit override for genesis
 ] {
     validate-mode $mode
 
@@ -2362,6 +2426,7 @@ def "main bench" [
     let txgen = (txgen-resolve-binaries)
 
     let gas_limit_args = if $gas_limit != "" { ["--gas-limit" $gas_limit] } else { [] }
+    let general_gas_limit_args = if $general_gas_limit != "" { ["--general-gas-limit" $general_gas_limit] } else { [] }
     let txgen_genesis_args = ["--mnemonic" (txgen-account-mnemonic)]
 
     # Auto-derive tracing OTLP URL: prefer GRAFANA_TEMPO, fall back to TEMPO_TELEMETRY_URL
@@ -2390,8 +2455,8 @@ def "main bench" [
     let tuning_state = if $tune { apply-system-tuning } else { { tuned: false } }
 
     # Validate tracy flag
-    if $tracy not-in ["off" "on" "full"] {
-        print $"Error: --tracy must be one of: off, on, full \(got '($tracy)'\)"
+    if $tracy not-in ["off" "tracy"] {
+        print $"Error: --tracy must be one of: off, tracy \(got '($tracy)'\)"
         exit 1
     }
     if $samply and $tracy != "off" {
@@ -2428,17 +2493,18 @@ def "main bench" [
         exit 1
     }
     # Validate hardfork names
+    let tempo_hardforks = (tempo-hardforks)
     if $baseline_hardfork != "" {
-        let valid = ($TEMPO_HARDFORKS | any { |f| $f == ($baseline_hardfork | str upcase) })
+        let valid = ($tempo_hardforks | any { |f| $f == ($baseline_hardfork | str upcase) })
         if not $valid {
-            print $"Error: unknown baseline hardfork '($baseline_hardfork)'. Valid: ($TEMPO_HARDFORKS | str join ', ')"
+            print $"Error: unknown baseline hardfork '($baseline_hardfork)'. Valid: ($tempo_hardforks | str join ', ')"
             exit 1
         }
     }
     if $feature_hardfork != "" {
-        let valid = ($TEMPO_HARDFORKS | any { |f| $f == ($feature_hardfork | str upcase) })
+        let valid = ($tempo_hardforks | any { |f| $f == ($feature_hardfork | str upcase) })
         if not $valid {
-            print $"Error: unknown feature hardfork '($feature_hardfork)'. Valid: ($TEMPO_HARDFORKS | str join ', ')"
+            print $"Error: unknown feature hardfork '($feature_hardfork)'. Valid: ($tempo_hardforks | str join ', ')"
             exit 1
         }
     }
@@ -2571,6 +2637,7 @@ def "main bench" [
                 and ($marker | get -o baseline_hardfork | default "") == ($baseline_hardfork | str upcase)
                 and ($marker | get -o feature_hardfork | default "") == ($feature_hardfork | str upcase)
                 and ($marker | get -o gas_limit | default "") == $gas_limit
+                and ($marker | get -o general_gas_limit | default "") == $general_gas_limit
                 and ($marker | get -o txgen_mnemonic | default "") == (txgen-account-mnemonic)
                 and ($"($baseline_datadir)/db" | path exists)
                 and ($"($feature_datadir)/db" | path exists)
@@ -2589,11 +2656,11 @@ def "main bench" [
                 if ($baseline_genesis_dir | path exists) { rm -rf $baseline_genesis_dir }
                 mkdir $baseline_genesis_dir
                 if $baseline == "local" {
-                    cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $baseline_genesis_dir -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$baseline_genesis_args ...$gas_limit_args
+                    cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $baseline_genesis_dir -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$baseline_genesis_args ...$gas_limit_args ...$general_gas_limit_args
                 } else {
                     do {
                         cd $baseline_wt
-                        cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $baseline_genesis_dir -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$baseline_genesis_args ...$gas_limit_args
+                        cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $baseline_genesis_dir -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$baseline_genesis_args ...$gas_limit_args ...$general_gas_limit_args
                     }
                 }
                 cp $"($baseline_genesis_dir)/genesis.json" $baseline_genesis_path
@@ -2604,13 +2671,13 @@ def "main bench" [
                 if ($feature_genesis_dir | path exists) { rm -rf $feature_genesis_dir }
                 mkdir $feature_genesis_dir
                 if $feature == "local" {
-                    cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $feature_genesis_dir -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$feature_genesis_args ...$gas_limit_args
+                    cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $feature_genesis_dir -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$feature_genesis_args ...$gas_limit_args ...$general_gas_limit_args
                 } else {
                     # Use feature worktree for feature genesis so it picks up any
                     # new hardfork-related genesis changes from the feature branch
                     do {
                         cd $feature_wt
-                        cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $feature_genesis_dir -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$feature_genesis_args ...$gas_limit_args
+                        cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $feature_genesis_dir -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$feature_genesis_args ...$gas_limit_args ...$general_gas_limit_args
                     }
                 }
                 cp $"($feature_genesis_dir)/genesis.json" $feature_genesis_path
@@ -2647,6 +2714,7 @@ def "main bench" [
                     baseline_hardfork: ($baseline_hardfork | str upcase)
                     feature_hardfork: ($feature_hardfork | str upcase)
                     gas_limit: $gas_limit
+                    general_gas_limit: $general_gas_limit
                     txgen_mnemonic: (txgen-account-mnemonic)
                 } [[$baseline_genesis_path "genesis-baseline.json"] [$feature_genesis_path "genesis-feature.json"]] $bloat $bloat_file
 
@@ -2665,6 +2733,7 @@ def "main bench" [
                 and ($marker.bloat_mib | into int) == $bloat
                 and ($marker.accounts | into int) == $genesis_accounts
                 and ($marker | get -o gas_limit | default "") == $gas_limit
+                and ($marker | get -o general_gas_limit | default "") == $general_gas_limit
                 and ($marker | get -o txgen_mnemonic | default "") == (txgen-account-mnemonic)
                 and ($"($datadir)/db" | path exists)
                 and ($"($meta_dir)/genesis.json" | path exists)
@@ -2680,11 +2749,11 @@ def "main bench" [
                     if not ($abs_localnet | path exists) { mkdir $abs_localnet }
                     print $"Generating genesis with ($genesis_accounts) accounts from baseline..."
                     if $baseline == "local" {
-                        cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $abs_localnet -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$gas_limit_args
+                        cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $abs_localnet -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$gas_limit_args ...$general_gas_limit_args
                     } else {
                         do {
                             cd $baseline_wt
-                            cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $abs_localnet -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$gas_limit_args
+                            cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $abs_localnet -a $genesis_accounts ...$txgen_genesis_args --no-dkg-in-genesis ...$gas_limit_args ...$general_gas_limit_args
                         }
                     }
                 }
@@ -2710,6 +2779,7 @@ def "main bench" [
                     accounts: $genesis_accounts,
                     bench_datadir: $datadir,
                     gas_limit: $gas_limit,
+                    general_gas_limit: $general_gas_limit,
                     txgen_mnemonic: (txgen-account-mnemonic)
                 } [[$genesis_path_std "genesis.json"]] $bloat $bloat_file
 
@@ -2726,8 +2796,8 @@ def "main bench" [
             docker compose -f $"($BENCH_DIR)/docker-compose.yml" up -d
         }
 
-        # Setup kernel permissions for tracy full mode (CPU sampling)
-        if $tracy == "full" and (^uname | str trim) == "Linux" {
+        # Setup kernel permissions for tracy CPU sampling.
+        if $tracy == "tracy" and (^uname | str trim) == "Linux" {
             print "Configuring system for tracy CPU sampling..."
             # Allow non-root perf event access (required for CPU sampling)
             try { sudo sysctl -w kernel.perf_event_paranoid=-1 } catch { }
@@ -2823,9 +2893,10 @@ def "main bench" [
             print "\nUploading tracy profiles to R2..."
             for run in $runs {
                 let profile = $"($results_dir)/tracy-profile-($run.label).tracy"
-                let viewer_url = (upload-tracy-profile $profile $run.label $run.git_ref)
-                if $viewer_url != null {
-                    $viewer_url | save -f $"($results_dir)/tracy-($run.label)-url.txt"
+                let tracy_urls = (upload-tracy-profile $profile $run.label $run.git_ref)
+                if $tracy_urls != null {
+                    $tracy_urls.viewer_url | save -f $"($results_dir)/tracy-($run.label)-url.txt"
+                    $tracy_urls.profile_url | save -f $"($results_dir)/tracy-($run.label)-profile-url.txt"
                 }
             }
         }
@@ -2873,6 +2944,8 @@ def "main bench" [
     | append (if $loud { ["--loud"] } else { [] })
     | append (if $node_args != "" { [$"--node-args=\"($node_args)\""] } else { [] })
     | append (if $bloat > 0 { ["--bloat" $"($bloat)"] } else { [] })
+    | append (if $gas_limit != "" { ["--gas-limit" $gas_limit] } else { [] })
+    | append (if $general_gas_limit != "" { ["--general-gas-limit" $general_gas_limit] } else { [] })
 
     # Spawn nodes as a background job (pipe output to show logs)
     let node_cmd_str = ($node_cmd | str join " ")
@@ -2911,6 +2984,8 @@ def "main bench" [
             --git-ref $current_sha
             --build-profile $profile
             --benchmark-mode $mode
+            --bloat-mib $bloat
+            --bloat-token-count ($TIP20_TOKEN_IDS | length)
             --skip-funding=($bloat > 0))
         $result
     } catch { |e|
@@ -3278,10 +3353,6 @@ tempo-precompiles = { path = '($tempo_root)/crates/precompiles' }
             let args = (build-base-args $genesis_path $datadir $log_dir "0.0.0.0" 8545 9001)
                 | append (build-dev-args)
                 | append ["--log.stdout.filter" "warn"]
-                | append [
-                    "--faucet.address" "0x20c0000000000000000000000000000000000002"
-                    "--faucet.address" "0x20c0000000000000000000000000000000000003"
-                ]
 
             # Build + run instrumented binary via cargo llvm-cov run (backgrounds itself)
             print "Building and starting instrumented tempo node..."
@@ -3323,7 +3394,8 @@ tempo-precompiles = { path = '($tempo_root)/crates/precompiles' }
                         --accounts $accounts
                         --max-concurrent-requests 100
                         --build-profile "coverage"
-                        --benchmark-mode "coverage")
+                        --benchmark-mode "coverage"
+                        --bloat-token-count ($TIP20_TOKEN_IDS | length))
                     if not $bench_result.ok {
                         print "Bench finished (or interrupted)."
                     }
@@ -3401,7 +3473,7 @@ def main [] {
     print "  --nodes <N>              Number of consensus nodes (default: 3, consensus mode only)"
     print "  --samply                 Profile nodes with samply"
     print "  --samply-args <ARGS>     Additional samply arguments (space-separated)"
-    print "  --tracy <MODE>           Tracy profiling: off (default), on, full"
+    print "  --tracy <MODE>           Tracy profiling: off (default), tracy"
     print "  --tracy-filter <FILTER>  Tracy tracing filter level (default: debug)"
     print "  --tracy-seconds <N>      Tracy capture duration limit in seconds (default: 30, 0 = unlimited)"
     print "  --tracy-offset <N>       Seconds to wait before starting tracy capture (default: 120)"
@@ -3415,7 +3487,8 @@ def main [] {
     print "  --feature-args <ARGS>        Additional node arguments for feature runs only"
     print "  --bench-args <ARGS>      Additional txgen generate arguments"
     print "  --bloat <N>              Generate TIP20 state bloat (size in MiB)"
-    print "  --gas-limit <N>          Block gas limit for genesis (raw number, default: 1000000000000)"
+    print "  --gas-limit <N>          Block gas limit for genesis"
+    print "  --general-gas-limit <N>  General (non-payment) gas limit for genesis"
     print ""
     print "Localnet flags:"
     print "  --mode <dev|consensus>   Mode (default: dev)"
@@ -3423,6 +3496,8 @@ def main [] {
     print "  --accounts <N>           Genesis accounts (default: 1000)"
     print "  --epoch-length <N>       Epoch length in blocks for generated genesis/localnet (default: 302400)"
     print "  --bloat <N>              Generate TIP20 state bloat (size in MiB)"
+    print "  --gas-limit <N>          Block gas limit for generated genesis"
+    print "  --general-gas-limit <N>  General (non-payment) gas limit for generated genesis"
     print "  --samply                 Enable samply profiling (foreground node only)"
     print "  --samply-args <ARGS>     Additional samply arguments (space-separated)"
     print "  --loud                   Show all node logs (WARN/ERROR shown by default)"
@@ -3449,7 +3524,6 @@ def main [] {
     print "Follower flags:"
     print "  --loud                   Show all node logs (WARN/ERROR shown by default)"
     print "  --reset                  Wipe follower data before starting"
-    print "  --certify                Enable experimental consensus certification in follow mode"
     print $"  --profile <P>            Cargo profile \(default: ($DEFAULT_PROFILE)\)"
     print $"  --features <F>           Cargo features \(default: ($DEFAULT_FEATURES)\)"
     print "  --node-args <ARGS>       Additional node arguments (space-separated)"

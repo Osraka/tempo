@@ -328,7 +328,7 @@ def main():
         else:
             meta = {
                 'edition': '"2024"',
-                'rust-version': '"1.93.0"',
+                'rust-version': '"1.96.0"',
                 'authors': '["Tempo Contributors"]',
                 'license': '"MIT OR Apache-2.0"',
                 'homepage': '"https://docs.tempo.xyz"',
@@ -392,7 +392,7 @@ def main():
         # the crates we're publishing: tempo-contracts and tempo-primitives)
         ws_toml_path = sys.argv[3]
         _, _, ws_path_deps, _, _ = parse_workspace_deps(ws_toml_path)
-        publish_keep = {'tempo-contracts', 'tempo-primitives', 'tempo-chainspec', 'tempo-alloy'}
+        publish_keep = {'tempo-hardfork', 'tempo-contracts', 'tempo-primitives', 'tempo-chainspec', 'tempo-alloy'}
         internal_deps = ws_path_deps - publish_keep
         text = strip_dep_lines(text, lambda n: n in internal_deps)
 

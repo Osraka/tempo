@@ -19,17 +19,21 @@ workspace = true
 
 [dependencies]
 base64.workspace = true
+blake3.workspace = true
+tar.workspace = true
 url.workspace = true
+zstd.workspace = true
 tempo-ext.workspace = true
 tempo-eyre.workspace = true
 tempo-node = { workspace = true, features = ["default"] }
-tempo-commonware-node.workspace = true
-tempo-commonware-node-config.workspace = true
+tempo-consensus.workspace = true
+tempo-consensus-config.workspace = true
 tempo-precompiles.workspace = true
 tempo-validator-config.workspace = true
 tempo-chainspec = { workspace = true, features = ["default"] }
 tempo-evm.workspace = true
 tempo-faucet.workspace = true
+tempo-telemetry-util.workspace = true
 
 alloy = { workspace = true, default-features = false, features = [
 	"network",
@@ -89,6 +93,7 @@ reth-network-peers.workspace = true
 reth-node-builder.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
+reth-prune-types.workspace = true
 reth-rpc-server-types.workspace = true
 secp256k1.workspace = true
 reth-storage-api.workspace = true
@@ -96,11 +101,12 @@ reth-trie.workspace = true
 reth-trie-db.workspace = true
 clap.workspace = true
 eyre.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 jiff.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
+tempfile.workspace = true
 opentelemetry-otlp = { version = "0.31", default-features = false, optional = true }
 pyroscope = { workspace = true, optional = true }
 pyroscope_pprofrs = { workspace = true, optional = true }
@@ -113,7 +119,7 @@ path = "src/main.rs"
 [features]
 default = ["asm-keccak", "jemalloc", "otlp", "keccak-cache-global"]
 
-bal = ["tempo-commonware-node/bal", "tempo-node/bal"]
+bal = ["tempo-consensus/bal", "tempo-node/bal"]
 
 asm-keccak = [
 	"alloy/asm-keccak",
