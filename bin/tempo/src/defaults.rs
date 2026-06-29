@@ -12,6 +12,7 @@ use url::Url;
 
 pub(crate) const DEFAULT_DOWNLOAD_URL: &str = "https://snapshots.tempoxyz.dev/4217";
 const SNAPSHOT_API_URL: &str = "https://snapshots.tempoxyz.dev/api/snapshots";
+const DEFAULT_MAX_PENDING_POOL_IMPORTS: usize = 50_000;
 
 /// CLI arguments for telemetry configuration.
 #[derive(Debug, Clone, clap::Args)]
@@ -237,9 +238,14 @@ fn init_otlp_defaults() {
     }
 }
 
-fn init_network_defaults() {
+fn network_defaults() -> DefaultNetworkArgs {
     DefaultNetworkArgs::default()
+        .with_max_pending_pool_imports(DEFAULT_MAX_PENDING_POOL_IMPORTS)
         .with_enforce_enr_fork_id(true)
+}
+
+fn init_network_defaults() {
+    network_defaults()
         .try_init()
         .expect("failed to initialize network defaults");
 }
@@ -262,4 +268,14 @@ pub(crate) fn init_defaults() {
     init_otlp_defaults();
     init_network_defaults();
     init_discovery_defaults();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_defaults_raise_pending_import_limit() {
+        assert_eq!(network_defaults().max_pending_pool_imports, 50_000);
+    }
 }
