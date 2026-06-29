@@ -348,7 +348,9 @@ mod tests {
         STORAGE_CREDITS_ADDRESS,
         native_multisig::NativeMultisig,
         nonce::NonceManager,
-        storage::{FromWord, Handler, StorageCtx, evm::EvmPrecompileStorageProvider},
+        storage::{
+            FromWord, Handler, StorageActions, StorageCtx, evm::EvmPrecompileStorageProvider,
+        },
         storage_credits::{CreditMode, StorageCredits},
         test_util::TIP20Setup,
         tip20::{ITIP20, TIP20Token},
@@ -896,7 +898,9 @@ mod tests {
         }));
 
         let mut evm = create_funded_evm_t6(account);
-        StorageCtx::enter_ctx(&mut evm.ctx, || NativeMultisig::new().initialize())?;
+        StorageCtx::enter_ctx(&mut evm.ctx, StorageActions::disabled(), || {
+            NativeMultisig::new().initialize()
+        })?;
 
         let result = evm.transact_commit(TempoTxEnv::from_recovered_tx(&signed_tx, account))?;
         assert!(result.is_success());
@@ -909,16 +913,20 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(nonce, 1);
 
-        StorageCtx::enter_ctx(&mut evm.ctx, || -> eyre::Result<()> {
-            let multisig = NativeMultisig::new();
-            assert!(multisig.is_multisig_account(account)?);
-            assert_eq!(multisig.get_multisig_config_id(account)?, config_id);
-            assert_eq!(
-                multisig.get_multisig_config(account, config_id)?.threshold,
-                config.threshold
-            );
-            Ok(())
-        })?;
+        StorageCtx::enter_ctx(
+            &mut evm.ctx,
+            StorageActions::disabled(),
+            || -> eyre::Result<()> {
+                let multisig = NativeMultisig::new();
+                assert!(multisig.is_multisig_account(account)?);
+                assert_eq!(multisig.get_multisig_config_id(account)?, config_id);
+                assert_eq!(
+                    multisig.get_multisig_config(account, config_id)?.threshold,
+                    config.threshold
+                );
+                Ok(())
+            },
+        )?;
 
         Ok(())
     }

@@ -2981,7 +2981,7 @@ mod tests {
     fn store_native_multisig_account(test: &mut TestHandlerEvm, config: &InitMultisig) {
         let account = config.account().unwrap();
         let config_id = config.config_id().unwrap();
-        StorageCtx::enter_ctx(&mut test.evm.inner.ctx, || {
+        StorageCtx::enter_ctx(&mut test.evm.inner.ctx, StorageActions::disabled(), || {
             let mut multisig = NativeMultisig::new();
             multisig.initialize()?;
             multisig.store_initial_config(account, config_id, config)
@@ -3319,7 +3319,7 @@ mod tests {
         test.validate_against_state_and_deduct_caller()
             .expect("valid bootstrap transaction should pass");
 
-        StorageCtx::enter_ctx(&mut test.evm.inner.ctx, || {
+        StorageCtx::enter_ctx(&mut test.evm.inner.ctx, StorageActions::disabled(), || {
             let multisig = NativeMultisig::new();
             assert!(multisig.is_multisig_account(account)?);
             assert_eq!(multisig.get_multisig_config_id(account)?, config_id);
@@ -6467,7 +6467,7 @@ mod tests {
             let access_key = Address::repeat_byte(0x44);
             let (mut evm, h) = make_evm(account, access_key, None, TempoHardfork::T6, None, false);
 
-            StorageCtx::enter_ctx(&mut evm.inner.ctx, || {
+            StorageCtx::enter_ctx(&mut evm.inner.ctx, StorageActions::disabled(), || {
                 let mut multisig = NativeMultisig::new();
                 multisig.initialize()?;
                 multisig.store_initial_config(account, config_id, &config)?;
@@ -6505,7 +6505,7 @@ mod tests {
                 "registered multisig keychain transaction should pass, got: {result:?}"
             );
 
-            StorageCtx::enter_ctx(&mut evm.inner.ctx, || {
+            StorageCtx::enter_ctx(&mut evm.inner.ctx, StorageActions::disabled(), || {
                 let keychain = AccountKeychain::new();
                 assert_eq!(
                     keychain.get_transaction_key(getTransactionKeyCall {}, account)?,
