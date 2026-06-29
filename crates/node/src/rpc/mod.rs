@@ -630,8 +630,9 @@ impl<N> LoadTransaction for TempoEthApi<N> where N: TempoEthApiBounds {}
 impl<N> EthTransactions for TempoEthApi<N>
 where
     N: TempoEthApiBounds,
-    <TempoEthApi<N> as RpcNodeCore>::Primitives: NodePrimitives<SignedTx = TempoTxEnvelope>,
+    <Self as RpcNodeCore>::Primitives: NodePrimitives<SignedTx = TempoTxEnvelope>,
 {
+    #[allow(clippy::manual_async_fn)]
     fn fill_transaction(
         &self,
         mut request: RpcTxReq<Self::NetworkTypes>,
@@ -680,7 +681,7 @@ where
                             Self::Error::from_eth_err(EthApiError::InvalidParams(err.to_string()))
                         })?;
                     (
-                        !has_init && !(has_config_id && has_signature_count),
+                        !(has_init || has_config_id && has_signature_count),
                         config_id_hint,
                         signature_count_hint,
                     )
@@ -766,7 +767,9 @@ where
                     let base_fee = header
                         .and_then(|h| h.base_fee_per_gas())
                         .unwrap_or_default();
-                    request.as_mut().set_max_fee_per_gas(base_fee as u128 + tip);
+                    request
+                        .as_mut()
+                        .set_max_fee_per_gas(u128::from(base_fee) + tip);
                 }
             }
 
