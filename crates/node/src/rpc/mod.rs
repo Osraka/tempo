@@ -427,21 +427,17 @@ fn load_native_multisig_simulation_hints(
     multisig_signature_count: Option<usize>,
     db: &mut impl Database<Error: Into<EthApiError>>,
 ) -> Result<Option<(B256, usize)>, EthApiError> {
-    let account_marker_slot = NativeMultisig::account_marker_storage_slot(from);
-    let account_marker = db
-        .storage(NATIVE_MULTISIG_ADDRESS, account_marker_slot)
+    let config_id_slot = NativeMultisig::config_id_storage_slot(from);
+    let config_id_word = db
+        .storage(NATIVE_MULTISIG_ADDRESS, config_id_slot)
         .map_err(Into::into)?;
-    if account_marker.is_zero() {
+    if config_id_word.is_zero() {
         return Ok(None);
     }
 
     let config_id = if let Some(config_id) = multisig_config_id {
         config_id
     } else {
-        let config_id_slot = NativeMultisig::config_id_storage_slot(from);
-        let config_id_word = db
-            .storage(NATIVE_MULTISIG_ADDRESS, config_id_slot)
-            .map_err(Into::into)?;
         let config_id = B256::from(config_id_word.to_be_bytes::<32>());
         if config_id.is_zero() {
             return Err(EthApiError::InvalidParams(
@@ -473,11 +469,9 @@ fn native_multisig_signature_count_for_threshold(
         ));
     }
 
-    let owners_len_slot = NativeMultisig::config_owners_len_storage_slot(account, config_id);
-    let owner_count: usize = db
-        .storage(NATIVE_MULTISIG_ADDRESS, owners_len_slot)
-        .map_err(Into::into)?
-        .saturating_to();
+    let (owners_len_slot, owners_len_offset) =
+        NativeMultisig::config_owners_len_storage_slot(account, config_id);
+    let owner_count = read_native_multisig_u32(db, owners_len_slot, owners_len_offset)? as usize;
     if owner_count == 0 {
         return Err(EthApiError::InvalidParams(
             "native multisig config has no owners".to_string(),
