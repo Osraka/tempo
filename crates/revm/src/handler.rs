@@ -92,6 +92,10 @@ const KEYCHAIN_VALIDATION_GAS: u64 = COLD_SLOAD_COST + 900;
 /// already covered by the base transaction stipend.
 const NATIVE_MULTISIG_VALIDATION_GAS: u64 = COLD_SLOAD_COST;
 
+/// Persistent storage rows created by native multisig bootstrap before owner rows:
+/// `config_ids[account]` plus the packed `{ threshold, owner_count }` header.
+const NATIVE_MULTISIG_BOOTSTRAP_FIXED_STORAGE_SLOTS: u64 = 2;
+
 /// Base gas for KeyAuthorization (22k storage + 5k buffer), signature gas added at runtime
 const KEY_AUTH_BASE_GAS: u64 = 27_000;
 
@@ -266,6 +270,43 @@ fn tempo_signature_verification_gas(signature: &TempoSignature) -> u64 {
             NATIVE_MULTISIG_VALIDATION_GAS + owner_signature_gas.saturating_sub(ECRECOVER_GAS)
         }
     }
+}
+
+#[inline]
+fn native_multisig_bootstrap_storage_slots(init: &InitMultisig) -> u64 {
+    let owner_slots = u64::try_from(init.owners.len()).unwrap_or(u64::MAX);
+    NATIVE_MULTISIG_BOOTSTRAP_FIXED_STORAGE_SLOTS.saturating_add(owner_slots)
+}
+
+/// Calculates persistent storage gas for native multisig bootstrap.
+///
+/// The committed bootstrap write is a protocol pre-execution write. It runs without TIP-1060
+/// storage-credit accounting because this intrinsic charge includes the creditable portion.
+/// The packed native multisig layout creates exactly:
+/// - one `config_ids[account]` slot
+/// - one packed header slot containing threshold and owner count
+/// - one packed owner slot per owner
+#[inline]
+fn calculate_native_multisig_bootstrap_storage_gas(
+    init: &InitMultisig,
+    gas_params: &GasParams,
+    spec: tempo_chainspec::hardfork::TempoHardfork,
+) -> (u64, u64) {
+    let num_sstores = native_multisig_bootstrap_storage_slots(init);
+
+    let mut sstore_cost = gas_params.get(GasId::sstore_set_without_load_cost());
+    if spec.is_t7() {
+        // T7 exposes only the SSTORE residual in the gas table. Since bootstrap storage is
+        // intrinsic-only, also charge the TIP-1060 creditable portion here.
+        sstore_cost = sstore_cost.saturating_add(STORAGE_CREDIT_VALUE);
+    }
+
+    let regular_gas = sstore_cost.saturating_mul(num_sstores);
+    let state_gas = gas_params
+        .get(GasId::sstore_set_state_gas())
+        .saturating_mul(num_sstores);
+
+    (regular_gas, state_gas)
 }
 
 #[derive(Debug, Clone)]
@@ -1858,13 +1899,14 @@ where
         // happen in the committed pre-execution phase. This also seeds the transient
         // bootstrapped-account guard before user calls can reach the multisig precompile.
         if let Some((account, config_id, config)) = native_multisig_bootstrap {
-            StorageCtx::enter_precompile(
+            StorageCtx::enter_evm_without_tip1060_accounting(
                 journal,
                 block,
                 cfg,
                 tx,
                 actions.clone(),
-                |mut multisig: NativeMultisig| {
+                || {
+                    let mut multisig = NativeMultisig::new();
                     multisig
                         .store_initial_config(account, config_id, &config)
                         .map_err(map_native_multisig_error::<DB>)
@@ -2656,6 +2698,7 @@ pub struct ValidationContext {
 /// - Key authorization costs (if present):
 ///   - Pre-T1B: 27k base + 3k ecrecover + 22k per spending limit
 ///   - T1B+: ecrecover + SLOAD + SSTORE × (1 + N limits)
+/// - Native multisig bootstrap storage costs when `multisig_init` is present
 /// - Floor gas calculation (EIP-7623, Prague+)
 pub fn calculate_aa_batch_intrinsic_gas<'a>(
     aa_env: &TempoBatchCallEnv,
@@ -2674,6 +2717,18 @@ pub fn calculate_aa_batch_intrinsic_gas<'a>(
 
     // 2. Signature verification gas
     gas.initial_regular_gas += tempo_signature_verification_gas(signature);
+
+    // 2b. Native multisig bootstrap storage costs.
+    if spec.is_t6()
+        && let Some(init) = signature
+            .as_multisig()
+            .and_then(|multisig_signature| multisig_signature.init())
+    {
+        let (regular_gas, state_gas) =
+            calculate_native_multisig_bootstrap_storage_gas(init, gas_params, spec);
+        gas.initial_regular_gas += regular_gas;
+        gas.initial_state_gas += state_gas;
+    }
 
     let cold_account_cost =
         gas_params.warm_storage_read_cost() + gas_params.cold_account_additional_cost();
@@ -3879,6 +3934,107 @@ mod tests {
             multisig_gas.initial_regular_gas - base_gas.initial_regular_gas,
             expected_overhead,
             "1-of-1 P256 native multisig should pay validation plus P256 cost relative to the traditional secp256k1 tx baseline"
+        );
+    }
+
+    #[test]
+    fn test_aa_gas_native_multisig_bootstrap_charges_packed_storage_slots_t7() {
+        use tempo_chainspec::constants::gas::SSTORE_CREATE_COST;
+
+        let gas_params = tempo_gas_params(TempoHardfork::T7);
+        let base_env = make_single_call_env(Bytes::from(vec![1, 2]));
+        let owner_signature =
+            PrimitiveSignature::Secp256k1(alloy_primitives::Signature::test_signature()).to_bytes();
+        let config = native_multisig_config();
+        let mut multisig_env = base_env.clone();
+        multisig_env.signature = TempoSignature::Multisig(MultisigSignature::new(
+            config.account().unwrap(),
+            config.config_id().unwrap(),
+            vec![owner_signature],
+            Some(config.clone()),
+        ));
+
+        let base_gas = calculate_aa_batch_intrinsic_gas(
+            &base_env,
+            &gas_params,
+            None::<std::iter::Empty<&AccessListItem>>,
+            TempoHardfork::T7,
+        )
+        .unwrap();
+        let multisig_gas = calculate_aa_batch_intrinsic_gas(
+            &multisig_env,
+            &gas_params,
+            None::<std::iter::Empty<&AccessListItem>>,
+            TempoHardfork::T7,
+        )
+        .unwrap();
+
+        let storage_slots = native_multisig_bootstrap_storage_slots(&config);
+        assert_eq!(storage_slots, 2 + config.owners.len() as u64);
+
+        let expected_storage_gas = SSTORE_CREATE_COST * storage_slots;
+        let expected_overhead = NATIVE_MULTISIG_VALIDATION_GAS + expected_storage_gas;
+        assert_eq!(
+            multisig_gas.initial_regular_gas - base_gas.initial_regular_gas,
+            expected_overhead,
+            "bootstrap should charge config_id, packed header, and one owner slot per owner"
+        );
+        assert_eq!(
+            multisig_gas.initial_state_gas, base_gas.initial_state_gas,
+            "T7 storage-credit accounting stays in regular intrinsic gas"
+        );
+    }
+
+    #[test]
+    fn test_aa_gas_native_multisig_bootstrap_populates_state_gas_with_amsterdam_params() {
+        let gas_params =
+            crate::gas_params::tempo_gas_params_with_amsterdam(TempoHardfork::T6, true);
+        let base_env = make_single_call_env(Bytes::from(vec![1, 2]));
+        let owner_signature =
+            PrimitiveSignature::Secp256k1(alloy_primitives::Signature::test_signature()).to_bytes();
+        let config = native_multisig_config();
+        let mut multisig_env = base_env.clone();
+        multisig_env.signature = TempoSignature::Multisig(MultisigSignature::new(
+            config.account().unwrap(),
+            config.config_id().unwrap(),
+            vec![owner_signature],
+            Some(config.clone()),
+        ));
+
+        let base_gas = calculate_aa_batch_intrinsic_gas(
+            &base_env,
+            &gas_params,
+            None::<std::iter::Empty<&AccessListItem>>,
+            TempoHardfork::T6,
+        )
+        .unwrap();
+        let multisig_gas = calculate_aa_batch_intrinsic_gas(
+            &multisig_env,
+            &gas_params,
+            None::<std::iter::Empty<&AccessListItem>>,
+            TempoHardfork::T6,
+        )
+        .unwrap();
+
+        let storage_slots = native_multisig_bootstrap_storage_slots(&config);
+        let expected_regular_storage = gas_params
+            .get(GasId::sstore_set_without_load_cost())
+            .saturating_mul(storage_slots);
+        let expected_state_storage = gas_params
+            .get(GasId::sstore_set_state_gas())
+            .saturating_mul(storage_slots);
+
+        assert_eq!(
+            multisig_gas.initial_regular_gas - base_gas.initial_regular_gas,
+            NATIVE_MULTISIG_VALIDATION_GAS + expected_regular_storage
+        );
+        assert_eq!(
+            multisig_gas.initial_state_gas - base_gas.initial_state_gas,
+            expected_state_storage
+        );
+        assert_eq!(
+            multisig_gas.initial_total_gas() - base_gas.initial_total_gas(),
+            NATIVE_MULTISIG_VALIDATION_GAS + expected_regular_storage + expected_state_storage
         );
     }
 
