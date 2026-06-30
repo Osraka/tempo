@@ -9,7 +9,7 @@ const TXGEN_HELPER_EXISTING_RECIPIENTS_PRESETS = [
     "tip20_protocol_nonces"
     "tip20_keychain_existing_recipients"
 ]
-const TXGEN_HELPER_ALWAYS_FUND_PRESETS = ["dex"]
+const TXGEN_HELPER_ALWAYS_FUND_PRESETS = ["dex" "tip20_native_multisig_1of1"]
 const TXGEN_HELPER_EXISTING_RECIPIENTS_START = 10000
 const TXGEN_HELPER_KEYCHAIN_ACCESS_KEYS_START = 100000
 const TXGEN_HELPER_KEYCHAIN_AUTHORIZE_SETUP_GAS_LIMIT = 20000000
@@ -186,6 +186,11 @@ def txgen-preset-path [preset: string] {
     }
 
     $spec_path
+}
+
+def txgen-preset-requires-funding [preset_path: string] {
+    let preset_name = ($preset_path | path basename | str replace --regex '\.yml$' '')
+    $preset_name == $TXGEN_HELPER_NATIVE_MULTISIG_1OF1_PRESET
 }
 
 def txgen-account-mnemonic [] {

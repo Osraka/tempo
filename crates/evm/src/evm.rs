@@ -324,7 +324,7 @@ mod tests {
         database::{EmptyDB, in_memory_db::CacheDB},
         state::EvmState,
     };
-    use std::{assert_matches, collections::BTreeMap};
+    use std::collections::BTreeMap;
     use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_precompiles::{
         NATIVE_MULTISIG_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS,
@@ -883,10 +883,10 @@ mod tests {
                     ..Default::default()
                 };
                 let result = evm.transact_raw(tx)?;
-                assert_matches!(
-                    result.result,
-                    ExecutionResult::Success { .. },
-                    "hardfork: {hardfork:?}"
+                assert!(
+                    matches!(&result.result, ExecutionResult::Success { .. }),
+                    "hardfork: {hardfork:?}; result: {:?}",
+                    result.result
                 );
                 let actions = evm
                     .take_actions()

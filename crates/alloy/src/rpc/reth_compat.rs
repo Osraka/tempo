@@ -246,12 +246,12 @@ fn create_mock_native_multisig_sig(
     let signatures =
         create_mock_native_multisig_owner_signatures(signature_count, key_type, key_data)?;
 
-    Ok(TempoSignature::Multisig(MultisigSignature {
-        account: derive_multisig_account(config_id),
+    Ok(TempoSignature::Multisig(MultisigSignature::new(
+        derive_multisig_account(config_id),
         config_id,
         signatures,
-        init: Some(init.clone()),
-    }))
+        Some(init.clone()),
+    )))
 }
 
 fn create_mock_native_multisig_sig_for_config(
@@ -267,16 +267,12 @@ fn create_mock_native_multisig_sig_for_config(
         return Err("multisig config_id does not derive transaction caller");
     }
 
-    Ok(TempoSignature::Multisig(MultisigSignature {
+    Ok(TempoSignature::Multisig(MultisigSignature::new(
         account,
         config_id,
-        signatures: create_mock_native_multisig_owner_signatures(
-            signature_count,
-            key_type,
-            key_data,
-        )?,
-        init: None,
-    }))
+        create_mock_native_multisig_owner_signatures(signature_count, key_type, key_data)?,
+        None,
+    )))
 }
 
 fn mock_multisig_signature_count_for_threshold(
@@ -545,10 +541,10 @@ mod tests {
             .as_multisig()
             .expect("mock native multisig signature");
 
-        assert_eq!(multisig_sig.init, Some(init));
-        assert_eq!(multisig_sig.account, account);
-        assert_eq!(multisig_sig.config_id, config_id);
-        assert_eq!(multisig_sig.signatures.len(), 1);
+        assert_eq!(multisig_sig.init(), Some(&init));
+        assert_eq!(multisig_sig.account(), account);
+        assert_eq!(multisig_sig.config_id(), config_id);
+        assert_eq!(multisig_sig.signature_count(), 1);
     }
 
     #[test]
@@ -596,11 +592,11 @@ mod tests {
             .as_multisig()
             .expect("mock native multisig signature");
 
-        assert_eq!(multisig_sig.init, None);
-        assert_eq!(multisig_sig.account, account);
-        assert_eq!(multisig_sig.config_id, config_id);
-        assert_eq!(multisig_sig.signatures.len(), 2);
-        assert!(multisig_sig.signatures.iter().all(|sig| sig.len() > 65));
+        assert_eq!(multisig_sig.init(), None);
+        assert_eq!(multisig_sig.account(), account);
+        assert_eq!(multisig_sig.config_id(), config_id);
+        assert_eq!(multisig_sig.signature_count(), 2);
+        assert!(multisig_sig.signatures().iter().all(|sig| sig.len() > 65));
     }
 
     #[test]
